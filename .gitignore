@@ -1,0 +1,11 @@
+# common
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+pip-*/
+.ds-logs/
+.env
+.env.*
+*.log
+.DS_Store
