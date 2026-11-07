@@ -124,3 +124,27 @@ The tournament builds **exactly that commit**. Anything you push afterwards is i
   - Big libraries load slowly. Your server must answer within 15 seconds of starting, so check that `import`s plus loading your model fit.
 - **Threads:** the base image limits PyTorch/numpy to 1 thread (`OMP_NUM_THREADS=1`), because many bots share the machine. Your bot gets about 1 CPU.
 - **Model files:** commit them to your repo normally. Each file must be under GitHub's 100 MB limit. **Git LFS files are not downloaded.**
+
+## Team notes (td26-poker-bot)
+
+### Strategy overview
+- `equity.py` — preflop strength from the precomputed table `data/preflop.npy` (built offline by `tools/build_preflop.py`), with a Monte Carlo fallback; `equity()` runs Monte Carlo over runouts and one random opponent hand with exact card removal, per-street sample counts, optional `opp_top` range narrowing, optional exact river enumeration, and caching.
+- `opponent.py` — `OpponentModel` profiles the opponent from every observed decision plus hands inferred at hand end. It classifies `maniac_pot`, `maniac_half`, `calling_station`, `check_fold`, and `random` (Bayesian comparison against fixed archetypes, with an `unknown` catch-all until confidence is high) and tracks `fold_to_bet`, `fold_to_reraise`, `agg`, VPIP/PFR, per-street/per-position rates, bet-size tells, and showdown stats. All calls are exception-safe.
+- `range_equity.py` — `range_equity()` estimates postflop equity against a narrowed range: sampled opponent hands must be in the top `opp_top` preflop fraction and the top `post_top` fraction of current made hands. It uses made-hand strength only (not draws), so `strategy.py` blends it with unnarrowed equity.
+- `strategy.py` — `decide(obs, prof, memory)` compares equity with pot odds (blended with the all-in break-even threshold by how likely the opponent keeps betting) and applies thresholds in the `P` dict by opponent group (`maniac`, `station`, `random`, `folder`, plus card-aware defaults). Experiments can override `P` with the `STRAT_PARAMS` JSON environment variable. Sample counts shrink as the time bank empties.
+- `agent.py`, `YOUR CODE HERE` block — wraps the decision in `try/except`, checks the returned action against `obs.legal_actions` and falls back to a safe legal action; tracks thinking time in `memory["t_used"]`/`memory["t_bank"]`; creates the per-half `OpponentModel` and updates it on every decision and at hand end. Import failures degrade gracefully instead of crashing the server.
+
+### How to test
+Run the fast unit tests with the system Python (numpy installed):
+```
+pytest tests -q
+python -m pytest -q test_agent.py
+```
+Then play local matches with the project harness in the parent project folder (not in this repo):
+```
+python tools/eval.py --agent bundle/agent.py --opponents all --seeds 1-5 --ports 5100-5139
+```
+`eval.py` and `results/*.csv` live in `F:\CYH\projects\datathon`, not in this repository. When invoking `judge_engine.py` manually on Windows, always pass full URLs such as `--agent1 http://127.0.0.1:5008 --agent2 http://127.0.0.1:5009`; bare ports can be misparsed.
+
+### Results so far
+WIN against all 4 official baseline bots on 5 seeds, with 0 errors (see the commit messages for the per-match numbers).

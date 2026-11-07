@@ -54,6 +54,8 @@ P = {
     # card-aware opponents betting postflop: equity vs their top-X% made hands (range_equity.py)
     "range_on": 1, "range_hedge": 0.5, "range_min": 0.12, "range_per_raise": 0.6,
     "range_default_freq": 0.35, "range_samples": 1000,
+    # bet-size tell: use showdown-calibrated P(strong | pot) vs P(strong | half)
+    "size_on": 1, "size_tell_min": 0.15,
     # re-raise steal vs opponents that fold to our re-raises
     "steal_on": 1, "steal_min_n": 15, "steal_edge": 0.15,
 }
@@ -104,6 +106,15 @@ def _opp_bet_this_street(obs) -> int:
     st = int(obs.street)
     return sum(1 for a in obs.action_history
                if a.street == st and not a.is_me and a.action in (HALF, POT))
+
+
+def _opp_last_raise(obs) -> int:
+    """Action int (HALF/POT) of the opponent's last raise this street, else -1."""
+    st = int(obs.street)
+    for a in reversed(obs.action_history):
+        if a.street == st and not a.is_me and a.action in (HALF, POT):
+            return int(a.action)
+    return -1
 
 
 def _opp_top(obs, prof, rr: bool) -> float:
@@ -189,8 +200,24 @@ def decide(obs, prof: dict, memory: dict) -> Action:
             used = memory.get("t_used", 0.0)
             if (P["range_on"] and RE is not None
                     and used < 0.6 * memory.get("t_bank", 8.0)):
-                freq = agg_s if bs.get("n_agg", 0) >= 10 else P["range_default_freq"]
-                post_top = freq * (P["range_per_raise"] ** (nb - 1))
+                size_tell_on = (
+                    P["size_on"] and prof
+                    and prof.get("n_size_half", 0) >= 8
+                    and prof.get("n_size_pot", 0) >= 8
+                    and prof.get("size_tell", 0.0) >= P["size_tell_min"])
+                if size_tell_on:
+                    # Pot bets come from the top chunk; half bets are the
+                    # medium chunk plus a possible top-chunk sizing mix.
+                    last = _opp_last_raise(obs)
+                    if last == POT:
+                        base = prof.get("bet_pot_rate", 0.2)
+                    elif last == HALF:
+                        base = prof.get("bet_half_rate", 0.2) + prof.get("bet_pot_rate", 0.2)
+                    else:
+                        base = 0.0
+                else:
+                    base = agg_s if bs.get("n_agg", 0) >= 10 else P["range_default_freq"]
+                post_top = base * (P["range_per_raise"] ** (nb - 1))
                 post_top = min(1.0, max(P["range_min"], post_top))
                 try:
                     er = RE.range_equity(obs.hole_cards, obs.board, opp_top, post_top,

@@ -58,6 +58,21 @@ PROFILE FIELDS (profile() -> dict; rates are k/n, with a neutral default when n 
   by_pos             {'btn': {...}, 'bb': {...}} same keys, opp on button / big blind
   saw_flop, n_saw_flop, wtsd, n_sd   flop seen / went to showdown (given flop)
   sd_cat             list[9]: showdown counts by opp hand category (score >> 20)
+  sd_cat_by_size     list[3] of list[9]: the same showdown counts split by the
+                     LARGEST postflop raise size the opponent used that hand
+                     (1 = half, 2 = pot; index 0 is unused)
+  size_tell, n_size_half, n_size_pot
+                     size_tell = P(strong | pot bets) - P(strong | half bets)
+                     at showdown. Strong is category >= STRONG_CAT (4 = trips+
+                     in Short Deck; a straight is category 3). n_size_* are the
+                     showdown counts behind each probability; size_tell is 0.0
+                     until both sizes have a showdown.
+  post_half, post_pot, n_post_free
+                     postflop FREE decisions (nothing to call): half bets,
+                     pot bets, and all of them (check + half + pot)
+  bet_half_rate, bet_pot_rate
+                     post_half / n_post_free and post_pot / n_post_free
+                     (default 0.2 each when n_post_free == 0)
   sd_weak_raise, n_sd_weak     P(opp raised postflop | showdown with high card/pair)
   sd_strong_raise, n_sd_strong P(opp raised postflop | showdown with straight+)
   my_net_bb          our cumulative net this half, in big blinds
@@ -88,6 +103,12 @@ CLASS_MIN_CONF = 0.90
 DEV_A, DEV_B = 1.0, 30.0  # Beta prior on a deterministic archetype's deviation rate (mean ~3%)
 
 ME, OPP = 0, 1
+
+# Strong showdown category for the size tell. Short-Deck categories are
+# 0 high card, 1 pair, 2 two pair, 3 straight, 4 trips, 5 full house,
+# 6 flush, 7 quads, 8 straight flush. We use the requested numeric cut
+# (>= 4, i.e. trips or better); "straight or better" would be >= 3.
+STRONG_CAT = 4
 
 
 def _idx(street: int, pos: int, ctx: int, act: int) -> int:
@@ -170,7 +191,7 @@ class _Hand:
 
     __slots__ = ("hand_index", "opp_pos", "street", "bets", "stacks", "acted",
                  "raises", "idx", "last_obs", "pf_decision", "vpip", "pfr",
-                 "raises_post", "saw_flop", "done", "opp_raised")
+                 "raises_post", "saw_flop", "done", "opp_raised", "opp_max_size")
 
     def __init__(self, hand_index: int, opp_is_button: bool, stack: int, bb: int, sb: int):
         self.hand_index = hand_index
@@ -189,6 +210,7 @@ class _Hand:
         self.vpip = False
         self.pfr = False
         self.raises_post = 0
+        self.opp_max_size = 0     # largest postflop raise: 0 none, 1 half, 2 pot
         self.saw_flop = False
         self.done = False
         self.opp_raised = False   # opponent raised on the current street
@@ -230,6 +252,10 @@ class OpponentModel:
         self.sd_n = 0           # showdowns among hands that saw a flop
         self.sd_cat = [0] * 9
         self.sd_cat_raised = [0] * 9
+        self.sd_cat_by_size = [[0] * 9 for _ in range(3)]  # [1]=half, [2]=pot
+        self.n_post_free = 0     # postflop FREE opponent decisions
+        self.post_half = 0       # ... of which RAISE_HALF
+        self.post_pot = 0        # ... of which RAISE_POT
         self.rr_n = 0            # opp decisions facing OUR re-raise (opp raised first this street)
         self.rr_fold = 0
         self.my_net = 0
@@ -299,6 +325,16 @@ class OpponentModel:
                 self.rr_fold += 1
         if act == HALF or act == POT:
             h.opp_raised = True
+            if street >= 1:
+                size = 1 if act == HALF else 2
+                if size > h.opp_max_size:
+                    h.opp_max_size = size
+        if street >= 1 and ctx == FREE:
+            self.n_post_free += 1
+            if act == HALF:
+                self.post_half += 1
+            elif act == POT:
+                self.post_pot += 1
         if street == 0:
             h.pf_decision = True
             if act == HALF or act == POT:
@@ -415,6 +451,8 @@ class OpponentModel:
                     if 0 <= cat <= 8:
                         self.sd_cat[cat] += 1
                         self.sd_cat_raised[cat] += 1 if h.raises_post > 0 else 0
+                        if h.raises_post > 0 and h.opp_max_size in (1, 2):
+                            self.sd_cat_by_size[h.opp_max_size][cat] += 1
                 except Exception:
                     self.errors += 1
         self._ver += 1
@@ -553,6 +591,21 @@ class OpponentModel:
         prof["n_sd_weak"] = weak_n
         prof["sd_strong_raise"] = _rate(strong_r, strong_n, 0.5)
         prof["n_sd_strong"] = strong_n
+        half_n = sum(self.sd_cat_by_size[1])
+        pot_n = sum(self.sd_cat_by_size[2])
+        half_strong = sum(self.sd_cat_by_size[1][STRONG_CAT:])
+        pot_strong = sum(self.sd_cat_by_size[2][STRONG_CAT:])
+        prof["sd_cat_by_size"] = [list(row) for row in self.sd_cat_by_size]
+        prof["n_size_half"] = half_n
+        prof["n_size_pot"] = pot_n
+        prof["size_tell"] = (
+            _rate(pot_strong, pot_n, 0.0) - _rate(half_strong, half_n, 0.0)
+            if half_n and pot_n else 0.0)
+        prof["bet_half_rate"] = _rate(self.post_half, self.n_post_free, 0.2)
+        prof["bet_pot_rate"] = _rate(self.post_pot, self.n_post_free, 0.2)
+        prof["post_half"] = self.post_half
+        prof["post_pot"] = self.post_pot
+        prof["n_post_free"] = self.n_post_free
         prof["fold_to_reraise"] = _rate(self.rr_fold, self.rr_n, 0.3)
         prof["n_reraise"] = self.rr_n
         prof["my_net_bb"] = self.my_net / self.bb if self.bb else float(self.my_net)
@@ -605,6 +658,10 @@ class OpponentModel:
             "by_pos": {"btn": dict(blk), "bb": dict(blk)},
             "saw_flop": 0.5, "n_saw_flop": 0, "wtsd": 0.4, "n_sd": 0, "sd_cat": [0] * 9,
             "sd_weak_raise": 0.2, "n_sd_weak": 0, "sd_strong_raise": 0.5, "n_sd_strong": 0,
+            "sd_cat_by_size": [[0] * 9 for _ in range(3)],
+            "size_tell": 0.0, "n_size_half": 0, "n_size_pot": 0,
+            "bet_half_rate": 0.2, "bet_pot_rate": 0.2,
+            "post_half": 0, "post_pot": 0, "n_post_free": 0,
             "fold_to_reraise": 0.3, "n_reraise": 0,
             "my_net_bb": 0.0, "tags": [], "errors": self.errors if hasattr(self, "errors") else 0,
         })
