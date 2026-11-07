@@ -47,6 +47,7 @@ PROFILE FIELDS (profile() -> dict; rates are k/n, with a neutral default when n 
   vpip_btn, n_pf_btn, vpip_bb, n_pf_bb   same split by the opponent's position
   agg, n_agg         raises / (raises + calls + checks), all streets
   fold_to_bet, n_face   folds / decisions facing a bet (FACE + CAPPED, excl. OPEN)
+  fold_to_reraise, n_reraise   folds / decisions facing OUR re-raise after the opponent raised this street
   call_vs_bet        calls / decisions facing a bet
   raise_vs_bet, n_face_rl   raises / FACE decisions (raising allowed)
   check_free, bet_free, n_free   check / bet rate when nothing to call
@@ -169,7 +170,7 @@ class _Hand:
 
     __slots__ = ("hand_index", "opp_pos", "street", "bets", "stacks", "acted",
                  "raises", "idx", "last_obs", "pf_decision", "vpip", "pfr",
-                 "raises_post", "saw_flop", "done")
+                 "raises_post", "saw_flop", "done", "opp_raised")
 
     def __init__(self, hand_index: int, opp_is_button: bool, stack: int, bb: int, sb: int):
         self.hand_index = hand_index
@@ -190,6 +191,7 @@ class _Hand:
         self.raises_post = 0
         self.saw_flop = False
         self.done = False
+        self.opp_raised = False   # opponent raised on the current street
 
     def set_street(self, s: int) -> None:
         if s != self.street:
@@ -197,6 +199,7 @@ class _Hand:
             self.bets = [0, 0]
             self.acted = [False, False]
             self.raises = 0
+            self.opp_raised = False
             if s >= 1:
                 self.saw_flop = True
 
@@ -227,6 +230,8 @@ class OpponentModel:
         self.sd_n = 0           # showdowns among hands that saw a flop
         self.sd_cat = [0] * 9
         self.sd_cat_raised = [0] * 9
+        self.rr_n = 0            # opp decisions facing OUR re-raise (opp raised first this street)
+        self.rr_fold = 0
         self.my_net = 0
         self.errors = 0
         self._hand = None
@@ -288,6 +293,12 @@ class OpponentModel:
     def _count(self, h: _Hand, street: int, ctx: int, act: int) -> None:
         self.cnt[_idx(street, h.opp_pos, ctx, act)] += 1
         self._ver += 1
+        if ctx in (FACE, CAPPED) and h.opp_raised:
+            self.rr_n += 1
+            if act == FOLD:
+                self.rr_fold += 1
+        if act == HALF or act == POT:
+            h.opp_raised = True
         if street == 0:
             h.pf_decision = True
             if act == HALF or act == POT:
@@ -542,6 +553,8 @@ class OpponentModel:
         prof["n_sd_weak"] = weak_n
         prof["sd_strong_raise"] = _rate(strong_r, strong_n, 0.5)
         prof["n_sd_strong"] = strong_n
+        prof["fold_to_reraise"] = _rate(self.rr_fold, self.rr_n, 0.3)
+        prof["n_reraise"] = self.rr_n
         prof["my_net_bb"] = self.my_net / self.bb if self.bb else float(self.my_net)
 
         best, conf, post = self._classify()
@@ -592,6 +605,7 @@ class OpponentModel:
             "by_pos": {"btn": dict(blk), "bb": dict(blk)},
             "saw_flop": 0.5, "n_saw_flop": 0, "wtsd": 0.4, "n_sd": 0, "sd_cat": [0] * 9,
             "sd_weak_raise": 0.2, "n_sd_weak": 0, "sd_strong_raise": 0.5, "n_sd_strong": 0,
+            "fold_to_reraise": 0.3, "n_reraise": 0,
             "my_net_bb": 0.0, "tags": [], "errors": self.errors if hasattr(self, "errors") else 0,
         })
         return prof

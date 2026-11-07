@@ -110,6 +110,8 @@ def choose_action(obs: Observation, memory: dict) -> Action:
             new_half(AgentConfig(), memory)
         prof = None
         opp = memory.get("opp")
+        if memory["t_used"] >= 0.9 * memory.get("t_bank", 8.0):
+            opp = None                      # bank nearly empty: skip tracking, cheap fallback
         if opp is not None:
             try:
                 opp.update_from_obs(obs)

@@ -29,6 +29,11 @@ import os
 import equity as E
 from game import Action
 
+try:
+    import range_equity as RE
+except Exception:          # module broken -> fall back to equity margins
+    RE = None
+
 # Tunable parameters (override for experiments with env STRAT_PARAMS='{"key": value}').
 # Card-blind opponent groups: "maniac" (always raise), "station", "random", "folder" (check/fold).
 # Per group: w = how likely they keep betting later (blends pot odds with all-in break-even),
@@ -46,6 +51,11 @@ P = {
     "bet_pf": 0.60, "bet_post": 0.60,
     "pot_step_raise": 0.08, "pot_step_bet": 0.10,   # equity above thr -> pot instead of half
     "call_margin_rr": 0.0,                          # extra equity needed to call, card-blind opp
+    # card-aware opponents betting postflop: equity vs their top-X% made hands (range_equity.py)
+    "range_on": 1, "range_hedge": 0.5, "range_min": 0.12, "range_per_raise": 0.6,
+    "range_default_freq": 0.35, "range_samples": 1000,
+    # re-raise steal vs opponents that fold to our re-raises
+    "steal_on": 1, "steal_min_n": 15, "steal_edge": 0.15,
 }
 try:
     P.update(json.loads(os.environ.get("STRAT_PARAMS", "") or "{}"))
@@ -166,14 +176,29 @@ def decide(obs, prof: dict, memory: dict) -> Action:
     never_folds = cls in ("maniac_pot", "maniac_half", "maniac", "calling_station") or (
         n_face >= 20 and fold_to_bet < 0.08)
 
-    # margin for a sane opponent's postflop aggression (their bets mean strength)
+    # a card-aware opponent's postflop bets mean strength: narrow its range
     margin = 0.0
+    e_bet = e                          # equity used when facing their bet
+    post_top = 1.0                     # their current-street range (fraction of made hands)
     if not rr and not preflop:
         nb = _opp_bet_this_street(obs)
         if nb:
             bs = prof["by_street"][street] if prof and "by_street" in prof else {}
             agg_s = bs.get("agg", 0.3) if bs.get("n_agg", 0) >= 10 else 0.3
             margin = (0.04 + 0.06 * (1.0 - min(1.0, agg_s * 2))) * min(nb, 2)
+            used = memory.get("t_used", 0.0)
+            if (P["range_on"] and RE is not None
+                    and used < 0.6 * memory.get("t_bank", 8.0)):
+                freq = agg_s if bs.get("n_agg", 0) >= 10 else P["range_default_freq"]
+                post_top = freq * (P["range_per_raise"] ** (nb - 1))
+                post_top = min(1.0, max(P["range_min"], post_top))
+                try:
+                    er = RE.range_equity(obs.hole_cards, obs.board, opp_top, post_top,
+                                         samples=P["range_samples"])
+                    e_bet = P["range_hedge"] * e + (1.0 - P["range_hedge"]) * er
+                    margin = 0.0
+                except Exception:
+                    e_bet = e
 
     # ---- facing a bet ----------------------------------------------------
     if to_call > 0:
@@ -183,7 +208,7 @@ def decide(obs, prof: dict, memory: dict) -> Action:
             thr = pot_odds
         else:
             thr = w * max(allin_thr, pot_odds) + (1.0 - w) * pot_odds
-        e_adj = e - margin
+        e_adj = e_bet - margin
         if rr:
             thr += P["call_margin_rr"]
 
@@ -197,6 +222,40 @@ def decide(obs, prof: dict, memory: dict) -> Action:
                 if never_folds or e_adj >= r_thr + P["pot_step_raise"]:
                     return _pick(legal, POT, HALF)
                 return _pick(legal, HALF, POT)
+
+        # re-raise steal vs opponents that fold to our re-raises (EV comparison)
+        if can_raise and not rr and P["steal_on"]:
+            n_rr = prof.get("n_reraise", 0) if prof else 0
+            f = prof.get("fold_to_reraise", 0.3) if prof else 0.3
+            e_called = None
+            if n_rr >= P["steal_min_n"] and f > 0.3:
+                # if they do not fold they hold the top (1 - f) of their current range
+                try:
+                    if preflop:
+                        top = max(0.1, (1.0 - f) * opp_top)
+                        e_called = E.equity(obs.hole_cards, (), samples=max(100, int(600 * top)),
+                                            opp_top=top)
+                    elif RE is not None:
+                        pt = max(0.05, (1.0 - f) * post_top)
+                        e_called = RE.range_equity(obs.hole_cards, obs.board, opp_top, pt,
+                                                   samples=P["range_samples"])
+                except Exception:
+                    e_called = None
+            if e_called is not None:
+                ev_cont = max(0.0, e_adj * (pot + to_call) - to_call) if e_adj >= thr else 0.0
+                best, best_ev = None, ev_cont
+                for a in (HALF, POT):
+                    if a not in legal:
+                        continue
+                    risk = obs.raise_to[a] - obs.my_bet
+                    if risk <= 0:
+                        continue
+                    fe = max(0.0, f - P["steal_edge"])
+                    ev = fe * pot + (1.0 - fe) * (e_called * (pot + 2 * risk - to_call) - risk)
+                    if ev > best_ev:
+                        best, best_ev = a, ev
+                if best is not None:
+                    return best
 
         if e_adj >= thr:
             return CALL
