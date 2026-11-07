@@ -59,6 +59,14 @@ P = {
     # re-raise steal vs opponents that fold to our re-raises
     "steal_on": 1, "steal_min_n": 15, "steal_edge": 0.15,
 }
+# Trained overrides (written by tools/train.py), then the env var on top.
+try:
+    _pf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "params.json")
+    if os.path.isfile(_pf) and not os.environ.get("STRAT_IGNORE_FILE"):
+        with open(_pf, encoding="utf-8") as _f:
+            P.update({k: v for k, v in json.load(_f).items() if k in P})
+except Exception:
+    pass
 try:
     P.update(json.loads(os.environ.get("STRAT_PARAMS", "") or "{}"))
 except Exception:
